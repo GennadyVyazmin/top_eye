@@ -1,4 +1,4 @@
-# /top_eye/src/core/video_processor.py - ИСПРАВЛЕННАЯ СТРОКА 128
+# /top_eye/src/core/video_processor.py
 import cv2
 import torch
 import numpy as np
@@ -31,7 +31,7 @@ class VideoProcessor:
         self.session_unique = set()
         self.detections_history = []
 
-        # Инициализация YOLO (позже)
+        # Инициализация моделей
         self.model = None
         self.tracker = None
         self.face_recognizer = None
@@ -63,12 +63,8 @@ class VideoProcessor:
                 print("⚠ DeepSORT не установлен, используется простой трекинг")
                 self.tracker = SimpleTracker()
 
-            # Face Recognition (пропускаем если есть проблемы с tensorflow)
+            # Face Recognition
             try:
-                # Пробуем установить tf-keras если нужно
-                import subprocess
-                import sys
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "tf-keras"])
                 from deepface import DeepFace
                 self.face_recognizer = DeepFace
                 print("✓ DeepFace инициализирован")
@@ -127,7 +123,7 @@ class VideoProcessor:
                 # Добавляем кадр в очередь (каждый N-й кадр для обработки)
                 if frame_count % self.config.PROCESS_EVERY_N_FRAMES == 0:
                     if not self.frame_queue.full():
-                        self.frame_queue.put(frame)
+                        self.frame_queue.put(frame.copy())  # Копируем кадр
 
                 frame_count += 1
 
@@ -189,30 +185,42 @@ class VideoProcessor:
     def _process_single_frame(self, frame):
         """Обработка одного кадра"""
         result = {
-            'frame': frame,
+            'frame': frame.copy() if frame is not None else None,
             'detections': [],
             'faces': [],
             'timestamp': datetime.now(),
-            'people_count': 0
+            'people_count': 0,
+            'fps': 0
         }
 
         try:
             # Если модели загружены, делаем детекцию
-            if self.model is not None:
-                # YOLO детекция - ИСПРАВЛЕН ПАРАМЕТР CONFIDENCE_THRESHOLD
-                yolo_results = self.model(frame,
-                                          conf=self.config.CONFIDENCE_THRESHOLD,  # ИСПРАВЛЕНО
-                                          device='cuda' if torch.cuda.is_available() else 'cpu',
-                                          verbose=False)
+            if self.model is not None and frame is not None:
+                start_time = time.time()
+
+                # YOLO детекция - УПРОЩЕННЫЙ ВАРИАНТ
+                with torch.no_grad():  # Отключаем вычисление градиентов для скорости
+                    yolo_results = self.model(
+                        frame,
+                        conf=self.config.CONFIDENCE_THRESHOLD,
+                        device='cuda' if torch.cuda.is_available() else 'cpu',
+                        verbose=False,
+                        classes=[0]  # Только люди (класс 0)
+                    )
 
                 # Фильтруем только людей (класс 0 в YOLO)
                 people_detections = []
                 for r in yolo_results:
-                    if r.boxes is not None:
-                        for box in r.boxes:
-                            if int(box.cls) == 0:  # person class
-                                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    # Проверяем, есть ли детекции
+                    if r.boxes is not None and len(r.boxes) > 0:
+                        boxes = r.boxes.cpu().numpy()  # Конвертируем в numpy
+
+                        for i in range(len(boxes)):
+                            box = boxes[i]
+                            if box.cls == 0:  # person class
+                                x1, y1, x2, y2 = box.xyxy[0].astype(int)
                                 conf = float(box.conf[0])
+
                                 people_detections.append({
                                     'bbox': [x1, y1, x2 - x1, y2 - y1],
                                     'confidence': conf
@@ -220,7 +228,14 @@ class VideoProcessor:
 
                 # Трекинг
                 if self.tracker is not None and people_detections:
-                    tracks = self.tracker.update_tracks(people_detections, frame=frame)
+                    # Конвертируем для DeepSORT
+                    deepsort_detections = []
+                    for det in people_detections:
+                        bbox = det['bbox']
+                        deepsort_detections.append([bbox[0], bbox[1], bbox[2], bbox[3], det['confidence']])
+
+                    # Обновляем трекер
+                    tracks = self.tracker.update_tracks(deepsort_detections, frame=frame)
 
                     for track in tracks:
                         if track.is_confirmed():
@@ -233,12 +248,27 @@ class VideoProcessor:
                                 'confidence': track.get_det_conf() if hasattr(track, 'get_det_conf') else 0.5
                             })
 
+                # Вычисляем FPS
+                end_time = time.time()
+                result['fps'] = 1.0 / (end_time - start_time) if (end_time - start_time) > 0 else 0
+
                 # Обновляем счетчик людей
                 result['people_count'] = len(result['detections'])
                 self.current_count = result['people_count']
 
+                # Обновляем статистику уникальных
+                for det in result['detections']:
+                    track_id = det['track_id']
+                    self.session_unique.add(track_id)
+
+                    # Для today_unique нужна будет дата
+                    today = datetime.now().date().isoformat()
+                    self.today_unique.add(f"{today}_{track_id}")
+
         except Exception as e:
-            print(f"Ошибка в обработке кадра: {e}")
+            print(f"Ошибка в обработке кадра: {str(e)[:100]}")  # Ограничиваем длину сообщения
+            import traceback
+            traceback.print_exc()  # Печатаем полный traceback для отладки
 
         return result
 
@@ -251,6 +281,15 @@ class VideoProcessor:
     def get_current_people_count(self):
         """Получить текущее количество людей в кадре"""
         return self.current_count
+
+    def get_statistics(self):
+        """Получить статистику"""
+        return {
+            'current_count': self.current_count,
+            'today_unique': len(self.today_unique),
+            'session_unique': len(self.session_unique),
+            'detections_history': len(self.detections_history)
+        }
 
     def stop(self):
         """Остановка обработки"""
