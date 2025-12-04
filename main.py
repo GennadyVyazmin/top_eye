@@ -1,27 +1,14 @@
-# src/main.py
+# main.py (в корне проекта)
+import sys
+import os
+
+# Добавляем корневую директорию в путь Python
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import argparse
 import signal
-import sys
-from src.config.settings import settings
-from src.core.video_processor import VideoProcessor
-from src.web.app import app
-from src.gui.main_window import MainWindow
-from PyQt5.QtWidgets import QApplication
-
-
-def run_web_server(processor):
-    """Запуск веб-сервера"""
-    app.state.processor = processor
-    import uvicorn
-    uvicorn.run(app, host=settings.WEB_HOST, port=settings.WEB_PORT)
-
-
-def run_gui(processor):
-    """Запуск GUI приложения"""
-    qt_app = QApplication(sys.argv)
-    window = MainWindow(processor)
-    window.show()
-    return qt_app.exec_()
+from config.settings import settings
+from core.video_processor import VideoProcessor
 
 
 def main():
@@ -34,7 +21,7 @@ def main():
     # Инициализация процессора
     processor = VideoProcessor(settings)
 
-    # Обработка сигналов для корректного завершения
+    # Обработка сигналов
     def signal_handler(sig, frame):
         print("Завершение работы...")
         processor.stop()
@@ -52,14 +39,30 @@ def main():
     else:  # both
         processor.start()
 
-        # Запуск в отдельных потоках
         import threading
         web_thread = threading.Thread(target=run_web_server, args=(processor,))
         web_thread.daemon = True
         web_thread.start()
 
-        # GUI запускается в основном потоке
         run_gui(processor)
+
+
+def run_web_server(processor):
+    from web.app import app
+    import uvicorn
+
+    app.state.processor = processor
+    uvicorn.run(app, host=settings.WEB_HOST, port=settings.WEB_PORT)
+
+
+def run_gui(processor):
+    from PyQt5.QtWidgets import QApplication
+    from gui.main_window import MainWindow
+
+    qt_app = QApplication(sys.argv)
+    window = MainWindow(processor)
+    window.show()
+    return qt_app.exec_()
 
 
 if __name__ == "__main__":
