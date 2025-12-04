@@ -50,20 +50,24 @@ class VideoProcessor:
             print(f"✓ YOLO модель загружена на {'CUDA' if torch.cuda.is_available() else 'CPU'}")
 
             # DeepSORT - ИСПРАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ
-            try:
-                from deep_sort_realtime.deepsort_tracker import DeepSort
-                self.tracker = DeepSort(
-                    max_age=self.config.TRACKING_MAX_AGE,
-                    n_init=3,
-                    max_cosine_distance=0.2,
-                    nn_budget=None,
-                    override_track_class=None,
-                    embedder="mobilenet"  # Используем более легкий embedder
-                )
-                print("✓ DeepSORT инициализирован (mobilenet)")
-            except ImportError:
-                print("⚠ DeepSORT не установлен, используется простой трекинг")
-                self.tracker = SimpleTracker()
+            # try:
+            #     from deep_sort_realtime.deepsort_tracker import DeepSort
+            #     self.tracker = DeepSort(
+            #         max_age=self.config.TRACKING_MAX_AGE,
+            #         n_init=3,
+            #         max_cosine_distance=0.2,
+            #         nn_budget=None,
+            #         override_track_class=None,
+            #         embedder="mobilenet"  # Используем более легкий embedder
+            #     )
+            #     print("✓ DeepSORT инициализирован (mobilenet)")
+            # except ImportError:
+            #     print("⚠ DeepSORT не установлен, используется простой трекинг")
+            #     self.tracker = SimpleTracker()
+
+            # DeepSORT - отключен
+            print("⚠ DeepSORT отключен, используется простой трекинг")
+            self.tracker = SimpleTracker()
 
             # Face Recognition
             try:
