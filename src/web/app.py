@@ -615,3 +615,28 @@ async def test_page():
     <p><a href="/health">Проверка здоровья системы</a></p>
     <p><a href="/api/stats">Текущая статистика (JSON)</a></p>
     """)
+
+
+# В /top_eye/src/web/app.py добавить новый endpoint:
+
+@app.get("/api/visitors")
+async def get_visitors():
+    """Получить информацию о посетителях"""
+    try:
+        if hasattr(app.state, 'processor'):
+            processor = app.state.processor
+            if hasattr(processor, 'get_visitor_details'):
+                visitors = processor.get_visitor_details(limit=20)
+                stats = processor.get_statistics()
+
+                return JSONResponse({
+                    'visitors': visitors,
+                    'statistics': stats,
+                    'timestamp': datetime.now().isoformat()
+                })
+    except Exception as e:
+        print(f"Ошибка получения посетителей: {e}")
+
+    return JSONResponse({'visitors': [], 'statistics': {}})
+
+# Также обновить HTML для отображения известных посетителей
