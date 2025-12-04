@@ -1,0 +1,200 @@
+<!-- src/web/templates/index.html -->
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Видеоаналитика - Спортивный зал</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            display: flex;
+            gap: 20px;
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+        .video-container {
+            flex: 3;
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .stats-container {
+            flex: 1;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .faces-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 10px;
+            margin-top: 20px;
+        }
+        .face-card {
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            text-align: center;
+        }
+        .face-card img {
+            max-width: 100%;
+            border-radius: 4px;
+        }
+        .stat-card {
+            background: #f8f9fa;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+        }
+        #video {
+            width: 100%;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="video-container">
+            <h2>Видео с камеры</h2>
+            <img id="video" alt="Видеопоток">
+
+            <h3>Люди в кадре</h3>
+            <div id="faces" class="faces-container">
+                <!-- Здесь будут отображаться лица -->
+            </div>
+        </div>
+
+        <div class="stats-container">
+            <h2>📊 Статистика</h2>
+
+            <div class="stat-card">
+                <h3>Сейчас в кадре</h3>
+                <p id="currentCount" class="stat-number">0</p>
+            </div>
+
+            <div class="stat-card">
+                <h3>Уникальных сегодня</h3>
+                <p id="todayUnique" class="stat-number">0</p>
+            </div>
+
+            <div class="stat-card">
+                <h3>Уникальных за тренировку</h3>
+                <p id="sessionUnique" class="stat-number">0</p>
+            </div>
+
+            <h3>Историческая статистика</h3>
+            <div id="historyStats">
+                <!-- Загружается через API -->
+            </div>
+
+            <button onclick="downloadStats()" style="margin-top: 20px; padding: 10px 20px;">
+                📥 Скачать полную статистику
+            </button>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket соединение для видео
+        const videoSocket = new WebSocket(`ws://${window.location.host}/ws/video`);
+
+        videoSocket.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'frame') {
+                // Обновление видео
+                document.getElementById('video').src =
+                    'data:image/jpeg;base64,' + data.frame;
+
+                // Обновление статистики
+                document.getElementById('currentCount').textContent =
+                    data.current_count;
+                document.getElementById('todayUnique').textContent =
+                    data.today_unique;
+                document.getElementById('sessionUnique').textContent =
+                    data.session_unique;
+
+                // Обновление лиц в кадре
+                updateFacesDisplay(data.faces || []);
+            }
+        };
+
+        // Загрузка исторической статистики
+        async function loadHistoricalStats() {
+            const response = await fetch('/api/stats');
+            const stats = await response.json();
+
+            const container = document.getElementById('historyStats');
+            container.innerHTML = '';
+
+            for (const [period, data] of Object.entries(stats)) {
+                const statDiv = document.createElement('div');
+                statDiv.className = 'stat-card';
+                statDiv.innerHTML = `
+                    <h4>${period}</h4>
+                    <p>Уникальных: ${data.unique_visitors || 0}</p>
+                    <p>Всего детекций: ${data.total_detections || 0}</p>
+                `;
+                container.appendChild(statDiv);
+            }
+        }
+
+        // Обновление отображения лиц
+        function updateFacesDisplay(faces) {
+            const container = document.getElementById('faces');
+            container.innerHTML = '';
+
+            faces.forEach(face => {
+                const faceCard = document.createElement('div');
+                faceCard.className = 'face-card';
+
+                // Конвертация изображения лица в base64
+                const imgData = arrayBufferToBase64(face.face_image);
+
+                faceCard.innerHTML = `
+                    <img src="data:image/jpeg;base64,${imgData}"
+                         alt="${face.identity}">
+                    <p>${face.identity}</p>
+                    <small>${new Date(face.timestamp).toLocaleTimeString()}</small>
+                `;
+                container.appendChild(faceCard);
+            });
+        }
+
+        // Вспомогательная функция для конвертации
+        function arrayBufferToBase64(buffer) {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return window.btoa(binary);
+        }
+
+        // Скачивание статистики
+        async function downloadStats() {
+            const response = await fetch('/api/stats/export');
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `статистика_${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        // Загрузка статистики каждые 30 секунд
+        setInterval(loadHistoricalStats, 30000);
+        loadHistoricalStats(); // Первоначальная загрузка
+    </script>
+</body>
+</html>
