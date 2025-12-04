@@ -188,7 +188,7 @@ from dataclasses import dataclass
 @dataclass
 class Settings:
     # Параметры камеры Trassir TR-D1415
-    RTSP_URL = os.getenv("RTSP_URL", "rtsp://admin:123456@192.168.1.100:554/stream1")
+    RTSP_URL = os.getenv("RTSP_URL", "rtsp://admin:admin@10.0.0.242:554/live/main")
     CAMERA_ID = "trassir_tr-d1415_1"
 
     # Настройки обработки
