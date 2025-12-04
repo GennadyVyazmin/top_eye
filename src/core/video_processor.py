@@ -1,4 +1,4 @@
-# /top_eye/src/core/video_processor.py
+# /top_eye/src/core/video_processor.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
 import cv2
 import torch
 import numpy as np
@@ -49,16 +49,18 @@ class VideoProcessor:
             self.model.to('cuda' if torch.cuda.is_available() else 'cpu')
             print(f"✓ YOLO модель загружена на {'CUDA' if torch.cuda.is_available() else 'CPU'}")
 
-            # DeepSORT
+            # DeepSORT - ИСПРАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ
             try:
                 from deep_sort_realtime.deepsort_tracker import DeepSort
                 self.tracker = DeepSort(
                     max_age=self.config.TRACKING_MAX_AGE,
                     n_init=3,
                     max_cosine_distance=0.2,
-                    nn_budget=None
+                    nn_budget=None,
+                    override_track_class=None,
+                    embedder="mobilenet"  # Используем более легкий embedder
                 )
-                print("✓ DeepSORT инициализирован")
+                print("✓ DeepSORT инициализирован (mobilenet)")
             except ImportError:
                 print("⚠ DeepSORT не установлен, используется простой трекинг")
                 self.tracker = SimpleTracker()
@@ -198,59 +200,92 @@ class VideoProcessor:
             if self.model is not None and frame is not None:
                 start_time = time.time()
 
-                # YOLO детекция - УПРОЩЕННЫЙ ВАРИАНТ
-                with torch.no_grad():  # Отключаем вычисление градиентов для скорости
+                # YOLO детекция
+                with torch.no_grad():
                     yolo_results = self.model(
                         frame,
                         conf=self.config.CONFIDENCE_THRESHOLD,
                         device='cuda' if torch.cuda.is_available() else 'cpu',
                         verbose=False,
-                        classes=[0]  # Только люди (класс 0)
+                        classes=[0]  # Только люди
                     )
 
-                # Фильтруем только людей (класс 0 в YOLO)
+                # Извлекаем детекции людей - ИСПРАВЛЕННЫЙ КОД
                 people_detections = []
-                for r in yolo_results:
-                    # Проверяем, есть ли детекции
-                    if r.boxes is not None and len(r.boxes) > 0:
-                        boxes = r.boxes.cpu().numpy()  # Конвертируем в numpy
+                if yolo_results and len(yolo_results) > 0:
+                    yolo_result = yolo_results[0]
+
+                    if yolo_result.boxes is not None and len(yolo_result.boxes) > 0:
+                        # Получаем данные в numpy формате
+                        boxes = yolo_result.boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
+                        confidences = yolo_result.boxes.conf.cpu().numpy()
+                        classes = yolo_result.boxes.cls.cpu().numpy()
 
                         for i in range(len(boxes)):
-                            box = boxes[i]
-                            if box.cls == 0:  # person class
-                                x1, y1, x2, y2 = box.xyxy[0].astype(int)
-                                conf = float(box.conf[0])
+                            if classes[i] == 0:  # person class
+                                x1, y1, x2, y2 = boxes[i].astype(int)
+                                conf = float(confidences[i])
 
                                 people_detections.append({
-                                    'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                    'bbox': [x1, y1, x2 - x1, y2 - y1],  # [x, y, w, h]
                                     'confidence': conf
                                 })
 
-                # Трекинг
+                # Трекинг с DeepSORT - ИСПРАВЛЕННЫЙ КОД
                 if self.tracker is not None and people_detections:
-                    # Конвертируем для DeepSORT
-                    deepsort_detections = []
-                    for det in people_detections:
-                        bbox = det['bbox']
-                        deepsort_detections.append([bbox[0], bbox[1], bbox[2], bbox[3], det['confidence']])
+                    try:
+                        # Конвертируем детекции в формат для DeepSORT
+                        # DeepSORT ожидает список списков: [[x, y, w, h, confidence], ...]
+                        deepsort_detections = []
+                        for det in people_detections:
+                            bbox = det['bbox']
+                            # Убеждаемся, что все значения float
+                            deepsort_detections.append([
+                                float(bbox[0]),  # x
+                                float(bbox[1]),  # y
+                                float(bbox[2]),  # w
+                                float(bbox[3]),  # h
+                                float(det['confidence'])  # confidence
+                            ])
 
-                    # Обновляем трекер
-                    tracks = self.tracker.update_tracks(deepsort_detections, frame=frame)
+                        # Обновляем трекер
+                        tracks = self.tracker.update_tracks(deepsort_detections, frame=frame)
 
-                    for track in tracks:
-                        if track.is_confirmed():
-                            bbox = track.to_tlbr()
-                            track_id = track.track_id
+                        # Обрабатываем треки
+                        for track in tracks:
+                            if track.is_confirmed():
+                                bbox = track.to_tlbr()  # [x1, y1, x2, y2]
+                                track_id = track.track_id
 
-                            result['detections'].append({
-                                'track_id': track_id,
-                                'bbox': bbox,
-                                'confidence': track.get_det_conf() if hasattr(track, 'get_det_conf') else 0.5
-                            })
+                                # Получаем confidence если доступен
+                                confidence = 0.5
+                                if hasattr(track, 'get_det_conf'):
+                                    try:
+                                        confidence = track.get_det_conf()
+                                    except:
+                                        pass
+                                elif hasattr(track, 'det_conf'):
+                                    confidence = track.det_conf
+
+                                result['detections'].append({
+                                    'track_id': int(track_id),
+                                    'bbox': [float(coord) for coord in bbox],
+                                    'confidence': float(confidence)
+                                })
+
+                    except Exception as e:
+                        print(f"Ошибка трекинга DeepSORT: {str(e)[:100]}")
+                        # Используем простой трекинг как fallback
+                        result['detections'] = self._simple_tracking(people_detections)
+
+                # Если трекер не инициализирован, используем простой
+                elif people_detections:
+                    result['detections'] = self._simple_tracking(people_detections)
 
                 # Вычисляем FPS
                 end_time = time.time()
-                result['fps'] = 1.0 / (end_time - start_time) if (end_time - start_time) > 0 else 0
+                processing_time = end_time - start_time
+                result['fps'] = 1.0 / processing_time if processing_time > 0 else 0
 
                 # Обновляем счетчик людей
                 result['people_count'] = len(result['detections'])
@@ -261,16 +296,38 @@ class VideoProcessor:
                     track_id = det['track_id']
                     self.session_unique.add(track_id)
 
-                    # Для today_unique нужна будет дата
+                    # Для today_unique добавляем дату
                     today = datetime.now().date().isoformat()
                     self.today_unique.add(f"{today}_{track_id}")
 
+                # Добавляем в историю
+                if result['people_count'] > 0:
+                    self.detections_history.append({
+                        'timestamp': result['timestamp'],
+                        'count': result['people_count'],
+                        'detections': result['detections']
+                    })
+
+                    # Ограничиваем историю последними 1000 записей
+                    if len(self.detections_history) > 1000:
+                        self.detections_history = self.detections_history[-1000:]
+
         except Exception as e:
-            print(f"Ошибка в обработке кадра: {str(e)[:100]}")  # Ограничиваем длину сообщения
-            import traceback
-            traceback.print_exc()  # Печатаем полный traceback для отладки
+            error_msg = str(e)
+            print(f"Ошибка в обработке кадра: {error_msg[:100]}")
 
         return result
+
+    def _simple_tracking(self, detections):
+        """Простой трекинг без DeepSORT"""
+        simple_detections = []
+        for i, det in enumerate(detections):
+            simple_detections.append({
+                'track_id': i + 1,  # Простой ID
+                'bbox': det['bbox'],  # [x, y, w, h]
+                'confidence': det['confidence']
+            })
+        return simple_detections
 
     def get_current_frame(self):
         """Получить последний обработанный кадр"""
@@ -288,8 +345,14 @@ class VideoProcessor:
             'current_count': self.current_count,
             'today_unique': len(self.today_unique),
             'session_unique': len(self.session_unique),
-            'detections_history': len(self.detections_history)
+            'total_detections': len(self.detections_history),
+            'avg_people_count': np.mean([d['count'] for d in self.detections_history[-100:]])
+            if self.detections_history else 0
         }
+
+    def get_detection_history(self, limit=100):
+        """Получить историю детекций"""
+        return self.detections_history[-limit:]
 
     def stop(self):
         """Остановка обработки"""
@@ -314,7 +377,7 @@ class SimpleTracker:
 
             def to_tlbr(self):
                 x, y, w, h = self.bbox
-                return [x, y, x + w, y + h]
+                return [float(x), float(y), float(x + w), float(y + h)]
 
             def is_confirmed(self):
                 return True
