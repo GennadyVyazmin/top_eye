@@ -1,16 +1,12 @@
 # /top_eye/src/web/app.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from fastapi.responses import HTMLResponse, JSONResponse
 import cv2
 import asyncio
 import json
 import base64
-from datetime import datetime, timedelta
-import numpy as np
-import io
-from PIL import Image
+from datetime import datetime
+import os
 
 app = FastAPI(title="Video Analytics System", version="1.0.0")
 
@@ -41,7 +37,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# Простой HTML интерфейс
+# Простой HTML интерфейс без статических файлов
 @app.get("/")
 async def get_dashboard():
     return HTMLResponse("""
@@ -56,11 +52,11 @@ async def get_dashboard():
                 margin: 0;
                 padding: 0;
                 box-sizing: border-box;
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                font-family: Arial, sans-serif;
             }
 
             body {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                background: #f0f2f5;
                 min-height: 100vh;
                 padding: 20px;
             }
@@ -77,100 +73,36 @@ async def get_dashboard():
                 flex: 3;
                 min-width: 300px;
                 background: white;
-                border-radius: 15px;
+                border-radius: 10px;
                 padding: 20px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             }
 
             .stats-panel {
                 flex: 1;
                 min-width: 300px;
                 background: white;
-                border-radius: 15px;
+                border-radius: 10px;
                 padding: 20px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             }
 
-            h1 {
-                color: white;
-                text-align: center;
-                margin-bottom: 30px;
-                font-size: 2.5em;
-                text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            h1, h2 {
+                color: #333;
+                margin-bottom: 20px;
             }
 
             .video-container {
-                position: relative;
                 background: #000;
-                border-radius: 10px;
+                border-radius: 8px;
                 overflow: hidden;
                 margin-bottom: 20px;
+                position: relative;
             }
 
             #video {
                 width: 100%;
                 display: block;
-            }
-
-            .stats-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-                gap: 15px;
-                margin-bottom: 30px;
-            }
-
-            .stat-card {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                padding: 20px;
-                border-radius: 10px;
-                text-align: center;
-                transition: transform 0.3s ease;
-            }
-
-            .stat-card:hover {
-                transform: translateY(-5px);
-            }
-
-            .stat-value {
-                font-size: 2.5em;
-                font-weight: bold;
-                margin: 10px 0;
-            }
-
-            .stat-label {
-                font-size: 0.9em;
-                opacity: 0.9;
-            }
-
-            .faces-container {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-                gap: 10px;
-                margin-top: 20px;
-            }
-
-            .face-card {
-                background: #f8f9fa;
-                border-radius: 8px;
-                padding: 10px;
-                text-align: center;
-                border: 2px solid #e9ecef;
-                transition: all 0.3s ease;
-            }
-
-            .face-card:hover {
-                border-color: #667eea;
-                transform: scale(1.05);
-            }
-
-            .face-card img {
-                width: 80px;
-                height: 80px;
-                border-radius: 50%;
-                object-fit: cover;
-                margin-bottom: 5px;
-                border: 3px solid #667eea;
             }
 
             .connection-status {
@@ -181,24 +113,73 @@ async def get_dashboard():
                 color: white;
                 padding: 5px 10px;
                 border-radius: 5px;
-                font-size: 0.8em;
+                font-size: 12px;
             }
 
-            .loading {
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 15px;
+                margin-bottom: 30px;
+            }
+
+            .stat-card {
+                background: #4a6fa5;
+                color: white;
+                padding: 15px;
+                border-radius: 8px;
                 text-align: center;
-                padding: 40px;
-                color: #666;
             }
 
-            @media (max-width: 768px) {
-                .container {
-                    flex-direction: column;
-                }
+            .stat-value {
+                font-size: 24px;
+                font-weight: bold;
+                margin: 5px 0;
+            }
+
+            .stat-label {
+                font-size: 12px;
+                opacity: 0.9;
+            }
+
+            .controls {
+                margin-top: 20px;
+                display: flex;
+                gap: 10px;
+            }
+
+            button {
+                padding: 10px 15px;
+                background: #4a6fa5;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
+                flex: 1;
+            }
+
+            button:hover {
+                background: #3a5a80;
+            }
+
+            #detectionsHistory {
+                margin-top: 20px;
+                max-height: 200px;
+                overflow-y: auto;
+                background: #f8f9fa;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 12px;
+            }
+
+            .detection-item {
+                padding: 5px;
+                border-bottom: 1px solid #ddd;
             }
         </style>
     </head>
     <body>
-        <h1>🏆 Видеоаналитика детского спортивного зала</h1>
+        <h1>🏆 Система видеоаналитики спортивного зала</h1>
 
         <div class="container">
             <div class="video-panel">
@@ -209,20 +190,23 @@ async def get_dashboard():
                         <span id="status">🟢 Подключение...</span>
                     </div>
                 </div>
-                <div class="faces-container" id="facesContainer">
-                    <!-- Здесь будут отображаться лица -->
+
+                <div class="controls">
+                    <button onclick="exportData('today')">📥 Экспорт за день</button>
+                    <button onclick="takeSnapshot()">📷 Снимок</button>
+                    <button onclick="toggleDetection()" id="detectionBtn">⏸️ Пауза детекции</button>
                 </div>
             </div>
 
             <div class="stats-panel">
-                <h2>📊 Статистика зала</h2>
+                <h2>📊 Статистика</h2>
                 <div class="stats-grid">
                     <div class="stat-card">
                         <div class="stat-label">Сейчас в зале</div>
                         <div class="stat-value" id="currentCount">0</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">За сегодня</div>
+                        <div class="stat-label">Уникальных сегодня</div>
                         <div class="stat-value" id="todayCount">0</div>
                     </div>
                     <div class="stat-card">
@@ -230,26 +214,13 @@ async def get_dashboard():
                         <div class="stat-value" id="sessionCount">0</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">FPS</div>
+                        <div class="stat-label">FPS обработки</div>
                         <div class="stat-value" id="fpsCount">0</div>
                     </div>
                 </div>
 
-                <h3>⚡ Быстрый экспорт</h3>
-                <div style="display: flex; gap: 10px; margin-top: 15px;">
-                    <button onclick="exportData('3h')" style="flex: 1; padding: 10px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer;">
-                        3 часа
-                    </button>
-                    <button onclick="exportData('today')" style="flex: 1; padding: 10px; background: #17a2b8; color: white; border: none; border-radius: 5px; cursor: pointer;">
-                        Сегодня
-                    </button>
-                    <button onclick="exportData('week')" style="flex: 1; padding: 10px; background: #ffc107; color: white; border: none; border-radius: 5px; cursor: pointer;">
-                        Неделя
-                    </button>
-                </div>
-
-                <h3 style="margin-top: 30px;">📋 История детекций</h3>
-                <div id="detectionsHistory" style="margin-top: 10px; max-height: 200px; overflow-y: auto; background: #f8f9fa; padding: 10px; border-radius: 5px;">
+                <h3>История детекций</h3>
+                <div id="detectionsHistory">
                     <!-- История будет здесь -->
                 </div>
             </div>
@@ -257,7 +228,7 @@ async def get_dashboard():
 
         <script>
             let ws;
-            let reconnectInterval = 3000;
+            let detectionEnabled = true;
 
             function connectWebSocket() {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -285,9 +256,6 @@ async def get_dashboard():
                             document.getElementById('sessionCount').textContent = data.session_unique || 0;
                             document.getElementById('fpsCount').textContent = data.fps ? data.fps.toFixed(1) : '0.0';
 
-                            // Обновляем лица
-                            updateFaces(data.faces || []);
-
                             // Обновляем историю
                             if (data.detections && data.detections.length > 0) {
                                 updateDetectionHistory(data.detections, data.timestamp);
@@ -299,31 +267,15 @@ async def get_dashboard():
                 };
 
                 ws.onclose = function() {
-                    console.log('WebSocket отключен, переподключение...');
+                    console.log('WebSocket отключен, переподключение через 3 сек...');
                     document.getElementById('status').innerHTML = '🔴 Отключено';
                     document.getElementById('status').style.color = '#dc3545';
-                    setTimeout(connectWebSocket, reconnectInterval);
+                    setTimeout(connectWebSocket, 3000);
                 };
 
                 ws.onerror = function(error) {
                     console.error('WebSocket ошибка:', error);
                 };
-            }
-
-            function updateFaces(faces) {
-                const container = document.getElementById('facesContainer');
-                if (faces.length === 0) {
-                    container.innerHTML = '<div class="loading">👥 Нет людей в кадре</div>';
-                    return;
-                }
-
-                container.innerHTML = faces.map(face => `
-                    <div class="face-card">
-                        <img src="data:image/jpeg;base64,${face.face_image || ''}" alt="Лицо">
-                        <div>ID: ${face.track_id || '?'}</div>
-                        <small>${face.identity || 'Неизвестный'}</small>
-                    </div>
-                `).join('');
             }
 
             function updateDetectionHistory(detections, timestamp) {
@@ -332,17 +284,14 @@ async def get_dashboard():
 
                 detections.forEach(det => {
                     const item = document.createElement('div');
-                    item.style.padding = '5px';
-                    item.style.borderBottom = '1px solid #dee2e6';
+                    item.className = 'detection-item';
                     item.innerHTML = `
-                        <small>${time}</small> - 
-                        <strong>ID ${det.track_id}</strong> 
-                        (${det.confidence ? (det.confidence * 100).toFixed(0) + '%' : '?'})
+                        <strong>${time}</strong> - ID ${det.track_id} (${det.confidence ? (det.confidence * 100).toFixed(0) + '%' : '?'})
                     `;
                     container.prepend(item);
 
                     // Ограничиваем количество записей
-                    if (container.children.length > 10) {
+                    if (container.children.length > 20) {
                         container.removeChild(container.lastChild);
                     }
                 });
@@ -360,14 +309,47 @@ async def get_dashboard():
                         a.click();
                         document.body.removeChild(a);
                         window.URL.revokeObjectURL(url);
+
+                        alert(`Статистика за ${period} экспортирована`);
                     })
-                    .catch(error => console.error('Ошибка экспорта:', error));
+                    .catch(error => {
+                        console.error('Ошибка экспорта:', error);
+                        alert('Ошибка при экспорте');
+                    });
+            }
+
+            function takeSnapshot() {
+                const video = document.getElementById('video');
+                if (video.src) {
+                    const link = document.createElement('a');
+                    link.href = video.src;
+                    link.download = `снимок_${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    alert('Снимок сохранен');
+                } else {
+                    alert('Нет видео для сохранения');
+                }
+            }
+
+            function toggleDetection() {
+                detectionEnabled = !detectionEnabled;
+                const btn = document.getElementById('detectionBtn');
+                btn.textContent = detectionEnabled ? '⏸️ Пауза детекции' : '▶️ Возобновить детекцию';
+
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ 
+                        type: 'control', 
+                        command: detectionEnabled ? 'enable_detection' : 'disable_detection' 
+                    }));
+                }
             }
 
             // Запускаем при загрузке
             document.addEventListener('DOMContentLoaded', connectWebSocket);
 
-            // Обновляем статистику каждые 30 секунд
+            // Автоматический ping каждые 30 секунд
             setInterval(() => {
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: 'ping' }));
@@ -382,78 +364,92 @@ async def get_dashboard():
 @app.websocket("/ws/video")
 async def websocket_video(websocket: WebSocket):
     await manager.connect(websocket)
+
     try:
         while True:
-            # Ждем сообщения от клиента (ping)
-            data = await websocket.receive_text()
-            message = json.loads(data)
+            # Ждем сообщения от клиента
+            try:
+                data = await websocket.receive_text()
+                message = json.loads(data)
 
-            if message.get('type') == 'ping':
-                # Отправляем текущий кадр
-                processor = app.state.processor
-                frame_data = processor.get_current_frame()
+                if message.get('type') == 'ping' or message.get('type') == 'control':
+                    # Получаем текущий кадр из процессора
+                    if hasattr(app.state, 'processor'):
+                        processor = app.state.processor
+                        frame_data = processor.get_current_frame()
 
-                if frame_data and frame_data.get('frame') is not None:
-                    try:
-                        # Кодируем кадр в JPEG
-                        frame = frame_data['frame']
-                        if frame is not None and frame.size > 0:
-                            # Рисуем bounding boxes
-                            for det in frame_data.get('detections', []):
-                                bbox = det['bbox']
-                                cv2.rectangle(frame,
-                                              (int(bbox[0]), int(bbox[1])),
-                                              (int(bbox[2]), int(bbox[3])),
-                                              (0, 255, 0), 2)
+                        if frame_data and frame_data.get('frame') is not None:
+                            try:
+                                frame = frame_data['frame']
 
-                                # ID трека
-                                cv2.putText(frame, f"ID: {det['track_id']}",
-                                            (int(bbox[0]), int(bbox[1]) - 10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                            (0, 255, 0), 2)
+                                # Если детекция включена и есть детекции, рисуем их
+                                detections_enabled = message.get('command') != 'disable_detection'
+                                if detections_enabled and frame_data.get('detections'):
+                                    for det in frame_data.get('detections', []):
+                                        bbox = det['bbox']
+                                        if len(bbox) >= 4:
+                                            # Рисуем прямоугольник
+                                            cv2.rectangle(frame,
+                                                          (int(bbox[0]), int(bbox[1])),
+                                                          (int(bbox[2]), int(bbox[3])),
+                                                          (0, 255, 0), 2)
 
-                            # Ресайз для веб-стрима
-                            frame_resized = cv2.resize(frame, (1280, 720))
+                                            # Подпись с ID
+                                            cv2.putText(frame, f"ID: {det.get('track_id', '?')}",
+                                                        (int(bbox[0]), int(bbox[1]) - 10),
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                                        (0, 255, 0), 2)
 
-                            # Кодируем в base64
-                            _, buffer = cv2.imencode('.jpg', frame_resized,
-                                                     [cv2.IMWRITE_JPEG_QUALITY, 70])
-                            frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                                # Ресайз для веб-стрима (опционально, для экономии трафика)
+                                if frame.shape[1] > 1280:
+                                    frame = cv2.resize(frame, (1280, int(1280 * frame.shape[0] / frame.shape[1])))
 
-                            # Получаем статистику
-                            stats = processor.get_statistics()
+                                # Кодируем в JPEG
+                                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                                _, buffer = cv2.imencode('.jpg', frame, encode_param)
+                                frame_base64 = base64.b64encode(buffer).decode('utf-8')
 
-                            # Формируем ответ
-                            response = {
-                                'type': 'frame',
-                                'frame': frame_base64,
-                                'current_count': stats['current_count'],
-                                'today_unique': stats['today_unique'],
-                                'session_unique': stats['session_unique'],
-                                'fps': frame_data.get('fps', 0),
-                                'detections': frame_data.get('detections', []),
-                                'faces': frame_data.get('faces', []),
-                                'timestamp': datetime.now().isoformat()
-                            }
+                                # Получаем статистику
+                                stats = {}
+                                if hasattr(processor, 'get_statistics'):
+                                    stats = processor.get_statistics()
 
-                            await websocket.send_json(response)
-                    except Exception as e:
-                        print(f"Ошибка кодирования кадра: {e}")
-                        # Отправляем пустой кадр
+                                # Отправляем кадр клиенту
+                                response = {
+                                    'type': 'frame',
+                                    'frame': frame_base64,
+                                    'current_count': frame_data.get('people_count', 0),
+                                    'today_unique': stats.get('today_unique', 0),
+                                    'session_unique': stats.get('session_unique', 0),
+                                    'fps': frame_data.get('fps', 0),
+                                    'detections': frame_data.get('detections', []),
+                                    'timestamp': datetime.now().isoformat()
+                                }
+
+                                await websocket.send_json(response)
+
+                            except Exception as e:
+                                print(f"Ошибка обработки кадра: {e}")
+                                # Отправляем сообщение об ошибке
+                                await websocket.send_json({
+                                    'type': 'error',
+                                    'message': str(e)
+                                })
+                    else:
+                        # Если процессор не инициализирован
                         await websocket.send_json({
-                            'type': 'frame',
-                            'frame': '',
-                            'current_count': 0,
-                            'today_unique': 0,
-                            'session_unique': 0,
-                            'fps': 0,
-                            'timestamp': datetime.now().isoformat()
+                            'type': 'error',
+                            'message': 'Процессор видео не инициализирован'
                         })
+
+            except json.JSONDecodeError:
+                # Игнорируем не-JSON сообщения
+                pass
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception as e:
-        print(f"WebSocket ошибка: {e}")
+        print(f"Ошибка WebSocket: {e}")
         manager.disconnect(websocket)
 
 
@@ -461,12 +457,14 @@ async def websocket_video(websocket: WebSocket):
 async def get_statistics():
     """Получить статистику"""
     try:
-        processor = app.state.processor
-        if processor:
-            return JSONResponse(processor.get_statistics())
-    except:
-        pass
+        if hasattr(app.state, 'processor'):
+            processor = app.state.processor
+            if hasattr(processor, 'get_statistics'):
+                return JSONResponse(processor.get_statistics())
+    except Exception as e:
+        print(f"Ошибка получения статистики: {e}")
 
+    # Возвращаем данные по умолчанию
     return JSONResponse({
         "current_count": 0,
         "today_unique": 0,
@@ -478,20 +476,33 @@ async def get_statistics():
 @app.get("/api/export/{period}")
 async def export_statistics(period: str):
     """Экспорт статистики"""
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
     # Генерируем тестовые данные
     data = {
         "period": period,
         "exported_at": datetime.now().isoformat(),
-        "camera": app.state.processor.config.CAMERA_ID if hasattr(app.state, 'processor') else "unknown",
+        "camera": "trassir_tr-d1415_1",
         "statistics": {
-            "current_count": app.state.processor.current_count if hasattr(app.state, 'processor') else 0,
-            "today_unique": len(app.state.processor.today_unique) if hasattr(app.state, 'processor') else 0,
-            "session_unique": len(app.state.processor.session_unique) if hasattr(app.state, 'processor') else 0
+            "current_count": 0,
+            "today_unique": 0,
+            "session_unique": 0
         },
         "detections": []
     }
+
+    # Пытаемся получить реальные данные
+    try:
+        if hasattr(app.state, 'processor'):
+            processor = app.state.processor
+            data["camera"] = processor.config.CAMERA_ID
+            data["statistics"] = {
+                "current_count": processor.current_count,
+                "today_unique": len(processor.today_unique),
+                "session_unique": len(processor.session_unique)
+            }
+    except:
+        pass
 
     return JSONResponse(data)
 
@@ -502,5 +513,12 @@ async def health_check():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
-# Добавляем статические файлы
-app.mount("/static", StaticFiles(directory="static"), name="static")
+@app.get("/test")
+async def test_page():
+    """Тестовая страница"""
+    return HTMLResponse("""
+    <h1>Система видеоаналитики работает! 🎉</h1>
+    <p><a href="/">Перейти к основной панели</a></p>
+    <p><a href="/health">Проверка здоровья</a></p>
+    <p><a href="/api/stats">Статистика</a></p>
+    """)
