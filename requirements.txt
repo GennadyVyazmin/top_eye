@@ -1,19 +1,39 @@
 # Основные зависимости
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-opencv-python==4.8.1.78
-ultralytics==8.0.196
-torch==2.1.0
-torchvision==0.16.0
-torchaudio==2.1.0
-numpy==1.24.3
-pandas==2.1.3
-pillow==10.1.0
-scikit-learn==1.3.2
-deepface==0.0.79
-pytz==2023.3.post1
-aiosqlite==0.19.0
-sqlalchemy==2.0.23
-PyQt5==5.15.10
-websockets==12.0
-streamlit==1.28.1  # для альтернативного веб-интерфейса
+fastapi
+uvicorn[standard]
+opencv-python
+opencv-contrib-python
+ultralytics
+torch
+torchvision
+torchaudio
+numpy
+pandas
+pillow
+scikit-learn
+deepface
+pytz
+aiosqlite
+sqlalchemy
+PyQt5
+websockets
+streamlit
+
+# Для видеоаналитики и трекинга
+deep-sort-realtime
+filterpy
+scipy
+pyyaml
+matplotlib
+
+# Для работы с базой данных
+alembic
+
+# Для веб-интерфейса
+jinja2
+aiofiles
+
+# Логирование и мониторинг
+loguru
+psutil
+gpustat
