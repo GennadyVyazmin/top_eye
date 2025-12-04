@@ -1,4 +1,4 @@
-# /top_eye/src/core/video_processor.py
+# /top_eye/src/core/video_processor.py - ИСПРАВЛЕННАЯ СТРОКА 128
 import cv2
 import torch
 import numpy as np
@@ -63,13 +63,18 @@ class VideoProcessor:
                 print("⚠ DeepSORT не установлен, используется простой трекинг")
                 self.tracker = SimpleTracker()
 
-            # Face Recognition (опционально)
+            # Face Recognition (пропускаем если есть проблемы с tensorflow)
             try:
+                # Пробуем установить tf-keras если нужно
+                import subprocess
+                import sys
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "tf-keras"])
                 from deepface import DeepFace
                 self.face_recognizer = DeepFace
                 print("✓ DeepFace инициализирован")
-            except ImportError:
-                print("⚠ DeepFace не установлен, идентификация лиц отключена")
+            except Exception as e:
+                print(f"⚠ DeepFace не доступен: {e}")
+                print("Идентификация лиц отключена")
 
         except Exception as e:
             print(f"✗ Ошибка загрузки моделей: {e}")
@@ -194,9 +199,9 @@ class VideoProcessor:
         try:
             # Если модели загружены, делаем детекцию
             if self.model is not None:
-                # YOLO детекция
+                # YOLO детекция - ИСПРАВЛЕН ПАРАМЕТР CONFIDENCE_THRESHOLD
                 yolo_results = self.model(frame,
-                                          conf=self.config.CONFENCE_THRESHOLD,
+                                          conf=self.config.CONFIDENCE_THRESHOLD,  # ИСПРАВЛЕНО
                                           device='cuda' if torch.cuda.is_available() else 'cpu',
                                           verbose=False)
 

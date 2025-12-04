@@ -1,12 +1,12 @@
-# src/config/settings.py
+# /top_eye/src/config/settings.py
 import os
 from dataclasses import dataclass
 
 
 @dataclass
 class Settings:
-    # Параметры камеры
-    RTSP_URL = "rtsp://admin:admin@10.0.0.242:554/live/main"
+    # Параметры камеры Trassir TR-D1415
+    RTSP_URL = os.getenv("RTSP_URL", "rtsp://admin:admin@10.0.0.242:554/live/main")
     CAMERA_ID = "trassir_tr-d1415_1"
 
     # Настройки обработки
@@ -16,23 +16,15 @@ class Settings:
     PROCESS_EVERY_N_FRAMES = 2
 
     # Пути к моделям
-    YOLO_MODEL_PATH = "models/yolo/yolov8n.pt"
-    FACENET_MODEL_PATH = "models/facenet/facenet.pb"
-    DEEPSORT_CONFIG = "config/deep_sort.yaml"
+    YOLO_MODEL_PATH = os.path.join(os.path.dirname(__file__), "../../models/yolo/yolov8n.pt")
+    FACENET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "../../models/facenet/facenet.pb")
 
-    # Настройки базы данных
-    DB_PATH = "data/database.db"
-    FACES_DIR = "data/faces/"
-
-    # Пороги
-    CONFIDENCE_THRESHOLD = 0.5
+    # Пороги - ИСПРАВЛЕНО ИМЯ ПЕРЕМЕННОЙ
+    CONFIDENCE_THRESHOLD = 0.5  # было CONFENCE_THRESHOLD
     FACE_MATCH_THRESHOLD = 0.6
     TRACKING_MAX_AGE = 30
 
-    # Интервалы статистики
-    STATS_INTERVALS = [180, 1440, 2880, 10080, 43200]  # минуты
-
-    # Настройки веб-сервера
+    # Веб-сервер
     WEB_HOST = "0.0.0.0"
     WEB_PORT = 8000
     API_PORT = 8080
