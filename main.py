@@ -70,12 +70,12 @@ def test_camera():
 
 def run_simple_mode():
     """Простой режим (старая версия)"""
-    from src.core.video_processor import VideoProcessor
+    from src.core.video_processor_final import LongTermVideoProcessor
     from src.web.app import app
     import uvicorn
     import signal as sig
 
-    processor = VideoProcessor(settings)
+    processor = LongTermVideoProcessor(settings)
 
     def signal_handler(sig, frame):
         print("\n🛑 Завершение работы...")
