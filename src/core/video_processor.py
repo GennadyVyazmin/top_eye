@@ -1,384 +1,99 @@
-# /top_eye/src/core/video_processor.py
+# /top_eye/src/core/video_processor_final.py
 import cv2
 import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
 import numpy as np
 from threading import Thread, Lock, Event
 from queue import Queue
 from datetime import datetime, timedelta
 import time
 import os
-import pickle
 import json
-import hashlib
-from collections import deque, defaultdict, OrderedDict
-from sklearn.neighbors import NearestNeighbors, BallTree
-from scipy.spatial.distance import cosine, euclidean
-from scipy.optimize import linear_sum_assignment
-import warnings
+from collections import OrderedDict, defaultdict
 
-warnings.filterwarnings('ignore')
-
-# Импорт дополнительных модулей
-from .kalman_tracker import KalmanTracker
+from .face_database import FaceDatabase
 from .reid_model import StrongReIDModel
+from .kalman_tracker import KalmanTracker
 
 
-class Track:
-    """Класс для хранения данных о треке"""
-    __slots__ = ['track_id', 'bbox', 'kalman', 'embeddings', 'features',
-                 'last_seen', 'first_seen', 'hits', 'age', 'time_since_update',
-                 'color', 'is_confirmed', 'consecutive_invisible', 'visible',
-                 'velocity', 'predicted_bbox', 'appearance', 'class_id']
-
-    def __init__(self, track_id, bbox, embedding=None, class_id=0):
-        self.track_id = track_id
-        self.bbox = np.array(bbox, dtype=np.float32)  # [x1, y1, x2, y2]
-        self.kalman = KalmanTracker(bbox)
-        self.embeddings = deque(maxlen=50)  # История эмбеддингов
-        self.features = deque(maxlen=20)  # Дополнительные фичи
-        if embedding is not None:
-            self.embeddings.append(embedding)
-            self.features.append(self._extract_features(bbox, embedding))
-
-        self.last_seen = time.time()
-        self.first_seen = time.time()
-        self.hits = 1
-        self.age = 0
-        self.time_since_update = 0
-        self.color = self._generate_color(track_id)
-        self.is_confirmed = False
-        self.consecutive_invisible = 0
-        self.visible = True
-        self.velocity = np.zeros(2, dtype=np.float32)
-        self.predicted_bbox = None
-        self.appearance = None
-        self.class_id = class_id
-
-    def _generate_color(self, track_id):
-        """Генерация уникального цвета для трека"""
-        np.random.seed(track_id)
-        return tuple(map(int, np.random.randint(50, 205, 3)))
-
-    def _extract_features(self, bbox, embedding):
-        """Извлечение дополнительных признаков"""
-        x1, y1, x2, y2 = bbox
-        return {
-            'width': x2 - x1,
-            'height': y2 - y1,
-            'aspect_ratio': (x2 - x1) / (y2 - y1) if (y2 - y1) > 0 else 1.0,
-            'area': (x2 - x1) * (y2 - y1),
-            'center_x': (x1 + x2) / 2,
-            'center_y': (y1 + y2) / 2,
-            'embedding_norm': np.linalg.norm(embedding) if embedding is not None else 0
-        }
-
-    def update(self, bbox, embedding=None, is_matched=True):
-        """Обновление трека"""
-        self.bbox = np.array(bbox, dtype=np.float32)
-        self.kalman.update(bbox)
-
-        if embedding is not None:
-            self.embeddings.append(embedding)
-            self.features.append(self._extract_features(bbox, embedding))
-
-        self.last_seen = time.time()
-        self.hits += 1
-        self.age += 1
-        self.time_since_update = 0
-
-        if is_matched:
-            self.consecutive_invisible = 0
-            if self.hits >= 3 and not self.is_confirmed:
-                self.is_confirmed = True
-        else:
-            self.consecutive_invisible += 1
-
-        # Обновляем скорость
-        if len(self.features) >= 2:
-            last_feat = list(self.features)[-1]
-            prev_feat = list(self.features)[-2]
-            self.velocity = np.array([
-                last_feat['center_x'] - prev_feat['center_x'],
-                last_feat['center_y'] - prev_feat['center_y']
-            ], dtype=np.float32)
-
-    def predict(self):
-        """Предсказание следующего положения"""
-        self.predicted_bbox = self.kalman.predict()
-        self.time_since_update += 1
-        return self.predicted_bbox
-
-    def get_embedding(self):
-        """Получение среднего эмбеддинга"""
-        if not self.embeddings:
-            return None
-        return np.mean(list(self.embeddings), axis=0)
-
-    def get_features(self):
-        """Получение последних признаков"""
-        if not self.features:
-            return None
-        return list(self.features)[-1]
-
-    def mark_missing(self):
-        """Отметить как пропавший"""
-        self.consecutive_invisible += 1
-        self.time_since_update += 1
-        self.visible = False
-
-    def is_reliable(self):
-        """Проверка надежности трека"""
-        return self.is_confirmed and self.hits >= 5 and self.consecutive_invisible < 10
-
-    def get_state(self):
-        """Получение состояния трека"""
-        return {
-            'track_id': self.track_id,
-            'bbox': self.bbox.tolist(),
-            'age': self.age,
-            'hits': self.hits,
-            'is_confirmed': self.is_confirmed,
-            'consecutive_invisible': self.consecutive_invisible,
-            'velocity': self.velocity.tolist(),
-            'last_seen': self.last_seen
-        }
-
-
-class AppearanceDatabase:
-    """База данных внешнего вида для долгосрочной ReID"""
-
-    def __init__(self, max_size=1000, similarity_threshold=0.85):
-        self.embeddings = []
-        self.track_ids = []
-        self.timestamps = []
-        self.max_size = max_size
-        self.similarity_threshold = similarity_threshold
-        self.kdtree = None
-        self._needs_rebuild = True
-
-    def add(self, track_id, embedding, timestamp=None):
-        """Добавление эмбеддинга"""
-        if timestamp is None:
-            timestamp = time.time()
-
-        self.embeddings.append(embedding)
-        self.track_ids.append(track_id)
-        self.timestamps.append(timestamp)
-        self._needs_rebuild = True
-
-        # Ограничиваем размер
-        if len(self.embeddings) > self.max_size:
-            self.embeddings.pop(0)
-            self.track_ids.pop(0)
-            self.timestamps.pop(0)
-
-    def query(self, embedding, max_results=5):
-        """Поиск похожих эмбеддингов"""
-        if not self.embeddings:
-            return []
-
-        if self._needs_rebuild:
-            self._rebuild_index()
-
-        # Поиск K ближайших соседей
-        distances, indices = self.kdtree.query([embedding], k=min(max_results, len(self.embeddings)))
-
-        results = []
-        for dist, idx in zip(distances[0], indices[0]):
-            similarity = 1 - dist  # Предполагаем нормализованные эмбеддинги
-            if similarity >= self.similarity_threshold:
-                results.append({
-                    'track_id': self.track_ids[idx],
-                    'similarity': float(similarity),
-                    'timestamp': self.timestamps[idx]
-                })
-
-        return results
-
-    def _rebuild_index(self):
-        """Перестроение индекса поиска"""
-        if self.embeddings:
-            self.kdtree = NearestNeighbors(
-                n_neighbors=min(10, len(self.embeddings)),
-                metric='cosine',
-                algorithm='ball_tree'
-            )
-            self.kdtree.fit(self.embeddings)
-            self._needs_rebuild = False
-
-
-class VideoProcessor:
-    """Финальная улучшенная версия видео процессора"""
+class LongTermVideoProcessor:
+    """Видео процессор с долговременным хранением лиц"""
 
     def __init__(self, config):
         self.config = config
-        print(f"🚀 Инициализация УЛУЧШЕННОГО процессора для камеры: {config.CAMERA_ID}")
+        print("🚀 Инициализация системы с ДОЛГОВРЕМЕННЫМ хранением")
 
         # Камера
         self.cap = None
         self.last_reconnect = time.time()
-        self.reconnect_interval = 3
         self.frame_size = (config.FRAME_WIDTH, config.FRAME_HEIGHT)
 
-        # Очереди и синхронизация
-        self.frame_queue = Queue(maxsize=30)
-        self.processed_queue = Queue(maxsize=30)
+        # Очереди
+        self.frame_queue = Queue(maxsize=20)
+        self.processed_queue = Queue(maxsize=20)
         self.lock = Lock()
         self.running = False
-        self.stop_event = Event()
+
+        # База данных лиц
+        self.face_db = FaceDatabase(config.DB_PATH)
 
         # Модели
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"📊 Устройство: {self.device}")
-
         self.model = None  # YOLO
-        self.reid_model = None  # ReID модель
-        self.transform = self._create_transforms()
+        self.reid_model = StrongReIDModel(device=str(self.device))
 
         # Трекинг
-        self.tracks = OrderedDict()  # {track_id: Track}
-        self.lost_tracks = OrderedDict()  # Потерянные треки
+        self.active_tracks = OrderedDict()  # {track_id: TrackInfo}
+        self.long_term_memory = {}  # Долговременная память лиц
         self.next_track_id = 1000
-        self.appearance_db = AppearanceDatabase(max_size=2000)
+        self.sessions = {}  # {track_id: session_id}
 
-        # Настройки трекинга
-        self.max_age = 60  # Максимальный возраст без обновления
-        self.min_hits = 3  # Минимум попаданий для подтверждения
-        self.iou_threshold = 0.3
-        self.reid_threshold = 0.75
-        self.confidence_threshold = config.CONFIDENCE_THRESHOLD
+        # Настройки
+        self.reid_threshold = 0.65  # Порог для распознавания
+        self.min_face_size = (100, 100)  # Минимальный размер лица
+        self.max_absent_time = 3600  # 1 час - считаем новым человеком
 
         # Статистика
-        self.current_count = 0
-        self.today_unique = set()
-        self.session_unique = set()
-        self.total_detections = 0
-        self.total_frames = 0
-        self.fps_history = deque(maxlen=100)
-
-        # Кэши
-        self.embedding_cache = OrderedDict()
-        self.feature_cache = OrderedDict()
-        self.max_cache_size = 500
+        self.stats = defaultdict(int)
+        self.stats['start_time'] = time.time()
 
         # Инициализация
-        self._init_models()
-        self._load_persistent_data()
+        self._init_yolo()
 
-        print("✅ Улучшенный видео процессор инициализирован")
+        print(f"✅ Система инициализирована с долговременным хранением")
+        print(f"   • База лиц: {len(self.face_db.face_cache)} записей")
         print(f"   • ReID порог: {self.reid_threshold}")
-        print(f"   • Max age: {self.max_age} кадров")
-        print(f"   • Min hits: {self.min_hits}")
+        print(f"   • Макс. время отсутствия: {self.max_absent_time // 3600}ч")
 
-    def _init_models(self):
-        """Инициализация моделей"""
+    def _init_yolo(self):
+        """Инициализация YOLO"""
         try:
-            # YOLOv8
             from ultralytics import YOLO
-            model_path = self.config.YOLO_MODEL_PATH
-
-            if not os.path.exists(model_path):
-                print("📥 Скачиваем YOLOv8n...")
-                model_path = 'yolov8n.pt'
-
-            self.model = YOLO(model_path)
+            self.model = YOLO(self.config.YOLO_MODEL_PATH)
             self.model.to(self.device)
-            print(f"✅ YOLOv8 загружен на {self.device}")
-
-            # ReID модель
-            self.reid_model = StrongReIDModel(device=self.device)
-            print("✅ ReID модель загружена")
-
-            # Оптимизация для inference
-            if torch.cuda.is_available():
-                torch.backends.cudnn.benchmark = True
-                torch.backends.cudnn.enabled = True
-
+            print(f"✅ YOLO загружен на {self.device}")
         except Exception as e:
-            print(f"❌ Ошибка инициализации моделей: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ Ошибка загрузки YOLO: {e}")
             raise
 
-    def _create_transforms(self):
-        """Создание трансформов для ReID"""
-        return transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((256, 128)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-
-    def _load_persistent_data(self):
-        """Загрузка сохраненных данных"""
-        try:
-            db_path = os.path.join(os.path.dirname(__file__), "../../data/visitors.db")
-            if os.path.exists(db_path):
-                with open(db_path, 'rb') as f:
-                    data = pickle.load(f)
-                    self.appearance_db = data.get('appearance_db', AppearanceDatabase())
-                    self.next_track_id = data.get('next_track_id', 1000)
-                    self.today_unique = set(data.get('today_unique', []))
-                print(f"📂 Загружено {len(self.appearance_db.embeddings)} эмбеддингов из базы")
-        except:
-            print("📂 Новая база данных")
-
-    def _save_persistent_data(self):
-        """Сохранение данных"""
-        try:
-            os.makedirs(os.path.dirname(self.config.DB_PATH), exist_ok=True)
-            data = {
-                'appearance_db': self.appearance_db,
-                'next_track_id': self.next_track_id,
-                'today_unique': list(self.today_unique),
-                'saved_at': datetime.now().isoformat()
-            }
-            with open(self.config.DB_PATH, 'wb') as f:
-                pickle.dump(data, f)
-        except Exception as e:
-            print(f"⚠ Ошибка сохранения базы: {e}")
-
     def start(self):
-        """Запуск обработки"""
-        if self.running:
-            return
-
+        """Запуск системы"""
         self.running = True
-        self.stop_event.clear()
+        Thread(target=self._capture_thread, daemon=True, name="Capture").start()
+        Thread(target=self._process_thread, daemon=True, name="Process").start()
+        Thread(target=self._maintenance_thread, daemon=True, name="Maintenance").start()
+        print("▶ Система запущена")
 
-        # Запуск потоков
-        threads = [
-            Thread(target=self._capture_frames, daemon=True, name="CaptureThread"),
-            Thread(target=self._process_frames, daemon=True, name="ProcessThread"),
-            Thread(target=self._manage_tracks, daemon=True, name="TrackManagerThread"),
-            Thread(target=self._monitor_system, daemon=True, name="MonitorThread")
-        ]
-
-        for thread in threads:
-            thread.start()
-
-        print("▶ Обработка видео запущена")
-
-    def _capture_frames(self):
-        """Поток захвата кадров"""
-        print("🎥 Захват кадров запущен")
-
-        while self.running and not self.stop_event.is_set():
+    def _capture_thread(self):
+        """Поток захвата видео"""
+        while self.running:
             try:
-                if self.cap is None or not self.cap.isOpened():
-                    if time.time() - self.last_reconnect > self.reconnect_interval:
-                        self._reconnect_camera()
-                    time.sleep(0.1)
+                if not self.cap or not self.cap.isOpened():
+                    self._reconnect_camera()
+                    time.sleep(1)
                     continue
 
-                success, frame = self.cap.read()
-                if not success:
-                    print("⚠ Ошибка чтения кадра")
+                ret, frame = self.cap.read()
+                if not ret:
                     self.cap.release()
                     self.cap = None
                     time.sleep(0.5)
@@ -391,8 +106,7 @@ class VideoProcessor:
                 if not self.frame_queue.full():
                     self.frame_queue.put((frame.copy(), time.time()))
 
-                # Контроль FPS
-                time.sleep(max(0, 1 / self.config.FPS - 0.001))
+                time.sleep(max(0, 1 / self.config.FPS - 0.01))
 
             except Exception as e:
                 print(f"❌ Ошибка захвата: {e}")
@@ -403,22 +117,14 @@ class VideoProcessor:
 
     def _reconnect_camera(self):
         """Переподключение к камере"""
-        print(f"🔌 Подключение к: {self.config.RTSP_URL}")
-
         try:
+            print(f"🔌 Подключение к: {self.config.RTSP_URL}")
+
             if self.cap:
                 self.cap.release()
 
-            # Пробуем разные опции для RTSP
             self.cap = cv2.VideoCapture(self.config.RTSP_URL)
-
-            # Оптимизации для RTSP
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.cap.set(cv2.CAP_PROP_FPS, self.config.FPS)
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
-
-            # Таймауты
-            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
 
             if self.cap.isOpened():
                 print("✅ Камера подключена")
@@ -432,137 +138,190 @@ class VideoProcessor:
             print(f"❌ Ошибка подключения: {e}")
             return False
 
-    def _process_frames(self):
-        """Поток обработки кадров"""
-        print("⚙ Обработка кадров запущена")
-
-        while self.running and not self.stop_event.is_set():
+    def _process_thread(self):
+        """Поток обработки"""
+        while self.running:
             try:
                 if not self.frame_queue.empty():
                     frame, timestamp = self.frame_queue.get()
-
-                    # Обработка с таймингом
-                    process_start = time.time()
-                    result = self._process_single_frame(frame, timestamp)
-                    process_time = time.time() - process_start
-
-                    # Сохраняем FPS
-                    if process_time > 0:
-                        self.fps_history.append(1 / process_time)
+                    result = self._process_frame(frame, timestamp)
 
                     if not self.processed_queue.full():
                         self.processed_queue.put(result)
 
-                    self.total_frames += 1
-
-                else:
-                    time.sleep(0.001)
+                time.sleep(0.001)
 
             except Exception as e:
                 print(f"❌ Ошибка обработки: {e}")
-                import traceback
-                traceback.print_exc()
                 time.sleep(0.1)
 
-    def _process_single_frame(self, frame, timestamp):
-        """Обработка одного кадра"""
+    def _process_frame(self, frame, timestamp):
+        """Обработка кадра"""
         result = {
             'frame': frame.copy(),
             'detections': [],
+            'known_faces': [],
             'timestamp': timestamp,
             'people_count': 0,
-            'fps': np.mean(self.fps_history) if self.fps_history else 0,
-            'processing_time': 0,
-            'tracks_info': []
+            'stats': self._get_stats()
         }
 
-        process_start = time.time()
-
         try:
-            # 1. Детекция YOLO
-            detections = self._yolo_detection(frame)
+            # 1. Детекция людей
+            people_detections = self._detect_people(frame)
 
-            # 2. Извлечение ReID эмбеддингов
-            detections_with_embeddings = self._extract_embeddings(frame, detections)
+            # 2. Для каждого человека извлекаем лицо и эмбеддинг
+            for det in people_detections:
+                # Извлекаем ROI лица
+                face_roi = self._extract_face_roi(frame, det['bbox'])
 
-            # 3. Прогнозирование для существующих треков
-            for track in self.tracks.values():
-                track.predict()
+                if face_roi is not None:
+                    # Получаем эмбеддинг
+                    embedding = self.reid_model.extract_embedding(face_roi)
 
-            # 4. Сопоставление треков
-            matched_pairs = self._match_tracks(detections_with_embeddings)
+                    if embedding is not None:
+                        # Ищем в базе данных
+                        face_id, person_id, similarity = self.face_db.find_similar_face(
+                            embedding,
+                            threshold=self.reid_threshold
+                        )
 
-            # 5. Обновление треков
-            updated_tracks = self._update_tracks(matched_pairs, detections_with_embeddings)
+                        if face_id:  # Нашли в базе
+                            # Обновляем информацию
+                            self.face_db.update_face(face_id, embedding=embedding,
+                                                     confidence=similarity, seen_now=True)
 
-            # 6. Создание новых треков
-            new_tracks = self._create_new_tracks(detections_with_embeddings, matched_pairs)
+                            # Добавляем детекцию в базу
+                            detection_id = self.face_db.add_detection(
+                                face_id,
+                                self.config.CAMERA_ID,
+                                similarity,
+                                det['bbox']
+                            )
 
-            # 7. Обновление потерянных треков
-            self._update_lost_tracks()
+                            # Начинаем/продолжаем сессию
+                            if face_id not in self.sessions:
+                                session_id = self.face_db.start_session(face_id,
+                                                                        self.config.CAMERA_ID)
+                                self.sessions[face_id] = session_id
 
-            # 8. Восстановление треков из базы
-            recovered_tracks = self._recover_tracks(detections_with_embeddings, matched_pairs)
+                            # Обновляем активный трек
+                            if face_id not in self.active_tracks:
+                                self.active_tracks[face_id] = {
+                                    'person_id': person_id,
+                                    'first_seen': time.time(),
+                                    'last_seen': time.time(),
+                                    'detection_count': 1,
+                                    'bbox': det['bbox'],
+                                    'embedding': embedding
+                                }
+                            else:
+                                self.active_tracks[face_id].update({
+                                    'last_seen': time.time(),
+                                    'detection_count': self.active_tracks[face_id]['detection_count'] + 1,
+                                    'bbox': det['bbox']
+                                })
 
-            # 9. Сбор результатов
-            all_tracks = list(self.tracks.values()) + recovered_tracks
-            result['people_count'] = len([t for t in all_tracks if t.visible])
-            self.current_count = result['people_count']
+                            result['detections'].append({
+                                'track_id': face_id,
+                                'person_id': person_id,
+                                'bbox': det['bbox'],
+                                'confidence': similarity,
+                                'status': 'KNOWN',
+                                'detection_count': self.active_tracks[face_id]['detection_count'],
+                                'color': (0, 255, 0)  # Зеленый для известных
+                            })
 
-            for track in all_tracks:
-                if track.visible:
-                    result['detections'].append({
-                        'track_id': track.track_id,
-                        'bbox': track.bbox.tolist(),
-                        'confidence': 0.9 if track.is_confirmed else 0.5,
-                        'age': track.age,
-                        'hits': track.hits,
-                        'is_confirmed': track.is_confirmed,
-                        'velocity': track.velocity.tolist(),
-                        'color': track.color
-                    })
+                            result['known_faces'].append(person_id)
+                            self.stats['known_detections'] += 1
 
-                    # Обновляем статистику уникальных
-                    if track.is_confirmed and track.hits > 10:
-                        self.session_unique.add(track.track_id)
-                        today = datetime.now().date().isoformat()
-                        self.today_unique.add(f"{today}_{track.track_id}")
+                        else:  # Новое лицо
+                            # Добавляем в базу
+                            new_face_id, new_person_id = self.face_db.add_face(
+                                embedding=embedding,
+                                person_id=None,
+                                name=f"Person_{self.next_track_id}",
+                                confidence=det['confidence'],
+                                metadata={
+                                    'first_detection': datetime.now().isoformat(),
+                                    'camera_id': self.config.CAMERA_ID,
+                                    'bbox': det['bbox']
+                                }
+                            )
 
-            # 10. Рисование на кадре
+                            if new_face_id:
+                                # Добавляем детекцию
+                                self.face_db.add_detection(
+                                    new_face_id,
+                                    self.config.CAMERA_ID,
+                                    det['confidence'],
+                                    det['bbox']
+                                )
+
+                                # Начинаем сессию
+                                session_id = self.face_db.start_session(new_face_id,
+                                                                        self.config.CAMERA_ID)
+                                self.sessions[new_face_id] = session_id
+
+                                # Добавляем в активные треки
+                                self.active_tracks[new_face_id] = {
+                                    'person_id': new_person_id,
+                                    'first_seen': time.time(),
+                                    'last_seen': time.time(),
+                                    'detection_count': 1,
+                                    'bbox': det['bbox'],
+                                    'embedding': embedding
+                                }
+
+                                result['detections'].append({
+                                    'track_id': new_face_id,
+                                    'person_id': new_person_id,
+                                    'bbox': det['bbox'],
+                                    'confidence': det['confidence'],
+                                    'status': 'NEW',
+                                    'detection_count': 1,
+                                    'color': (0, 165, 255)  # Оранжевый для новых
+                                })
+
+                                self.stats['new_detections'] += 1
+                                self.next_track_id += 1
+
+            # 3. Проверяем активные треки (не появившиеся в этом кадре)
+            self._update_missing_tracks()
+
+            # 4. Обновляем статистику
+            result['people_count'] = len(result['detections'])
+            self.stats['total_frames'] += 1
+            self.stats['total_detections'] += len(result['detections'])
+
+            # 5. Рисуем результат
             self._draw_detections(frame, result['detections'])
-
-            # 11. Информация о треках
-            result['tracks_info'] = [track.get_state() for track in all_tracks[:10]]
-
-            self.total_detections += len(result['detections'])
 
         except Exception as e:
             print(f"⚠ Ошибка обработки кадра: {e}")
-
-        result['processing_time'] = time.time() - process_start
+            import traceback
+            traceback.print_exc()
 
         return result
 
-    def _yolo_detection(self, frame):
-        """Детекция YOLO"""
+    def _detect_people(self, frame):
+        """Детекция людей YOLO"""
         detections = []
 
         try:
             with torch.no_grad():
                 results = self.model(
                     frame,
-                    conf=self.confidence_threshold,
+                    conf=self.config.CONFIDENCE_THRESHOLD,
                     device=self.device,
                     verbose=False,
                     classes=[0],  # Только люди
-                    imgsz=640,
-                    agnostic_nms=True,
-                    max_det=50
+                    imgsz=640
                 )
 
             if results and len(results) > 0:
                 result = results[0]
-                if result.boxes is not None and len(result.boxes) > 0:
+                if result.boxes is not None:
                     boxes = result.boxes.xyxy.cpu().numpy()
                     confidences = result.boxes.conf.cpu().numpy()
 
@@ -570,393 +329,271 @@ class VideoProcessor:
                         x1, y1, x2, y2 = boxes[i].astype(int)
                         conf = float(confidences[i])
 
-                        # Фильтрация по размеру
                         width = x2 - x1
                         height = y2 - y1
 
-                        if width > 40 and height > 80 and width < 500 and height < 800:
+                        if width > 40 and height > 80:
                             detections.append({
                                 'bbox': [float(x1), float(y1), float(x2), float(y2)],
                                 'confidence': conf,
-                                'center': [(x1 + x2) / 2, (y1 + y2) / 2],
                                 'width': width,
-                                'height': height,
-                                'area': width * height
+                                'height': height
                             })
 
         except Exception as e:
-            print(f"⚠ Ошибка YOLO детекции: {e}")
+            print(f"⚠ Ошибка детекции: {e}")
 
         return detections
 
-    def _extract_embeddings(self, frame, detections):
-        """Извлечение ReID эмбеддингов"""
-        detections_with_emb = []
+    def _extract_face_roi(self, frame, bbox):
+        """Извлечение ROI лица"""
+        try:
+            x1, y1, x2, y2 = map(int, bbox)
 
-        for det in detections:
-            x1, y1, x2, y2 = map(int, det['bbox'])
+            # Вырезаем верхнюю часть тела (где обычно лицо)
+            face_height = int((y2 - y1) * 0.4)  # 40% от высоты тела
+            face_y1 = y1
+            face_y2 = y1 + face_height
 
-            # Вырезаем и обрабатываем ROI
-            roi = frame[max(0, y1):min(frame.shape[0], y2),
-            max(0, x1):min(frame.shape[1], x2)]
+            # Корректируем координаты
+            face_y1 = max(0, face_y1)
+            face_y2 = min(frame.shape[0], face_y2)
 
-            if roi.size == 0:
-                continue
+            face_roi = frame[face_y1:face_y2, x1:x2]
 
-            # Проверяем кэш
-            roi_hash = hashlib.md5(roi.tobytes()).hexdigest()
-            if roi_hash in self.embedding_cache:
-                embedding = self.embedding_cache[roi_hash]
-            else:
-                embedding = self.reid_model.extract_embedding(roi)
-                if embedding is not None:
-                    self.embedding_cache[roi_hash] = embedding
-                    if len(self.embedding_cache) > self.max_cache_size:
-                        self.embedding_cache.popitem(last=False)
+            if face_roi.size == 0:
+                return None
 
-            if embedding is not None:
-                det['embedding'] = embedding
-                detections_with_emb.append(det)
+            # Проверяем размер
+            if face_roi.shape[0] < self.min_face_size[0] or face_roi.shape[1] < self.min_face_size[1]:
+                return None
 
-        return detections_with_emb
+            return face_roi
 
-    def _match_tracks(self, detections):
-        """Сопоставление треков с детекциями"""
-        matched_pairs = []
+        except Exception as e:
+            print(f"⚠ Ошибка извлечения лица: {e}")
+            return None
 
-        if not self.tracks or not detections:
-            return matched_pairs
-
-        # Создаем матрицу стоимости
-        cost_matrix = np.zeros((len(self.tracks), len(detections)))
-        track_ids = list(self.tracks.keys())
-
-        for i, track_id in enumerate(track_ids):
-            track = self.tracks[track_id]
-
-            for j, det in enumerate(detections):
-                # 1. IoU стоимость
-                iou = self._compute_iou(track.bbox, det['bbox'])
-                iou_cost = 1 - iou
-
-                # 2. ReID стоимость
-                reid_cost = 1
-                if 'embedding' in det and track.embeddings:
-                    track_embedding = track.get_embedding()
-                    if track_embedding is not None:
-                        similarity = 1 - cosine(det['embedding'], track_embedding)
-                        reid_cost = 1 - similarity
-
-                # 3. Расстояние между центрами
-                center_dist = self._compute_center_distance(track.bbox, det['bbox'])
-                dist_cost = min(1, center_dist / 200)
-
-                # 4. Комбинированная стоимость с весами
-                weight_iou = 0.4 if iou > 0.1 else 0.1
-                weight_reid = 0.4 if track.is_confirmed else 0.3
-                weight_dist = 0.2
-
-                total_cost = (weight_iou * iou_cost +
-                              weight_reid * reid_cost +
-                              weight_dist * dist_cost)
-
-                # 5. Штраф за долгое отсутствие
-                if track.consecutive_invisible > 0:
-                    total_cost *= (1 + track.consecutive_invisible * 0.1)
-
-                cost_matrix[i, j] = total_cost
-
-        # Венгерский алгоритм для оптимального сопоставления
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-        for i, j in zip(row_ind, col_ind):
-            if cost_matrix[i, j] < 0.7:  # Порог сопоставления
-                matched_pairs.append((track_ids[i], j))
-
-        return matched_pairs
-
-    def _update_tracks(self, matched_pairs, detections):
-        """Обновление сопоставленных треков"""
-        updated_tracks = []
-
-        for track_id, det_idx in matched_pairs:
-            if track_id in self.tracks:
-                track = self.tracks[track_id]
-                det = detections[det_idx]
-
-                # Обновляем трек
-                track.update(det['bbox'], det.get('embedding'))
-
-                # Обновляем базу внешнего вида
-                if 'embedding' in det:
-                    self.appearance_db.add(track_id, det['embedding'])
-
-                updated_tracks.append(track)
-
-                # Удаляем использованную детекцию
-                detections[det_idx]['matched'] = True
-
-        return updated_tracks
-
-    def _create_new_tracks(self, detections, matched_pairs):
-        """Создание новых треков"""
-        new_tracks = []
-        matched_indices = set(j for _, j in matched_pairs)
-
-        for i, det in enumerate(detections):
-            if i not in matched_indices and not det.get('matched', False):
-                # Создаем новый трек
-                track_id = self.next_track_id
-                self.next_track_id += 1
-
-                new_track = Track(
-                    track_id=track_id,
-                    bbox=det['bbox'],
-                    embedding=det.get('embedding')
-                )
-
-                self.tracks[track_id] = new_track
-                new_tracks.append(new_track)
-
-                # Добавляем в базу внешнего вида
-                if 'embedding' in det:
-                    self.appearance_db.add(track_id, det['embedding'])
-
-        return new_tracks
-
-    def _update_lost_tracks(self):
-        """Обновление потерянных треков"""
+    def _update_missing_tracks(self):
+        """Обновление пропавших треков"""
+        current_time = time.time()
         tracks_to_remove = []
 
-        for track_id, track in list(self.tracks.items()):
-            if not track.visible:
-                track.mark_missing()
+        for face_id, track_info in list(self.active_tracks.items()):
+            if current_time - track_info['last_seen'] > 2:  # Не появлялся 2 секунды
+                # Завершаем сессию если есть
+                if face_id in self.sessions:
+                    self.face_db.end_session(self.sessions[face_id])
+                    del self.sessions[face_id]
 
-                # Проверяем, не пора ли удалить трек
-                if (track.consecutive_invisible > self.max_age or
-                        (not track.is_confirmed and track.consecutive_invisible > 10)):
-                    # Перемещаем в lost_tracks
-                    self.lost_tracks[track_id] = track
-                    tracks_to_remove.append(track_id)
+                # Удаляем из активных если долго нет
+                if current_time - track_info['last_seen'] > 10:  # 10 секунд
+                    tracks_to_remove.append(face_id)
 
-        for track_id in tracks_to_remove:
-            del self.tracks[track_id]
-
-    def _recover_tracks(self, detections, matched_pairs):
-        """Восстановление треков из базы внешнего вида"""
-        recovered_tracks = []
-        matched_indices = set(j for _, j in matched_pairs)
-
-        for i, det in enumerate(detections):
-            if i in matched_indices or det.get('matched', False):
-                continue
-
-            if 'embedding' in det:
-                # Ищем в базе внешнего вида
-                matches = self.appearance_db.query(det['embedding'], max_results=3)
-
-                for match in matches:
-                    if match['similarity'] > self.reid_threshold:
-                        # Восстанавливаем трек
-                        track_id = match['track_id']
-
-                        if track_id in self.lost_tracks:
-                            # Возвращаем из lost_tracks
-                            track = self.lost_tracks[track_id]
-                            track.update(det['bbox'], det['embedding'])
-                            track.visible = True
-
-                            self.tracks[track_id] = track
-                            del self.lost_tracks[track_id]
-
-                            recovered_tracks.append(track)
-                            print(f"🔄 Восстановлен трек {track_id} (схожесть: {match['similarity']:.3f})")
-
-                            det['matched'] = True
-                            break
-
-        return recovered_tracks
-
-    def _compute_iou(self, box1, box2):
-        """Вычисление IoU"""
-        x1_min, y1_min, x1_max, y1_max = box1
-        x2_min, y2_min, x2_max, y2_max = box2
-
-        inter_x_min = max(x1_min, x2_min)
-        inter_y_min = max(y1_min, y2_min)
-        inter_x_max = min(x1_max, x2_max)
-        inter_y_max = min(y1_max, y2_max)
-
-        inter_area = max(0, inter_x_max - inter_x_min) * max(0, inter_y_max - inter_y_min)
-        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
-        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
-
-        return inter_area / (box1_area + box2_area - inter_area + 1e-10)
-
-    def _compute_center_distance(self, box1, box2):
-        """Вычисление расстояния между центрами"""
-        center1 = [(box1[0] + box1[2]) / 2, (box1[1] + box1[3]) / 2]
-        center2 = [(box2[0] + box2[2]) / 2, (box2[1] + box2[3]) / 2]
-
-        return np.sqrt((center1[0] - center2[0]) ** 2 + (center1[1] - center2[1]) ** 2)
-
-    def _manage_tracks(self):
-        """Управление треками"""
-        print("📊 Менеджер треков запущен")
-
-        while self.running and not self.stop_event.is_set():
-            try:
-                # Периодическое сохранение
-                if int(time.time()) % 300 == 0:  # Каждые 5 минут
-                    self._save_persistent_data()
-
-                # Очистка кэшей
-                if len(self.embedding_cache) > self.max_cache_size * 2:
-                    for _ in range(self.max_cache_size):
-                        if self.embedding_cache:
-                            self.embedding_cache.popitem(last=False)
-
-                time.sleep(1)
-
-            except Exception as e:
-                print(f"⚠ Ошибка менеджера треков: {e}")
-                time.sleep(5)
-
-    def _monitor_system(self):
-        """Мониторинг системы"""
-        print("📈 Мониторинг системы запущен")
-
-        while self.running and not self.stop_event.is_set():
-            try:
-                # Логирование статистики
-                if self.total_frames % 100 == 0:
-                    print(f"📊 Статистика: "
-                          f"Кадров: {self.total_frames}, "
-                          f"Треков: {len(self.tracks)}, "
-                          f"Потерянных: {len(self.lost_tracks)}, "
-                          f"FPS: {np.mean(self.fps_history):.1f}")
-
-                time.sleep(1)
-
-            except Exception as e:
-                print(f"⚠ Ошибка мониторинга: {e}")
-                time.sleep(5)
+        for face_id in tracks_to_remove:
+            del self.active_tracks[face_id]
 
     def _draw_detections(self, frame, detections):
-        """Рисование детекций на кадре"""
+        """Рисование детекций"""
         for det in detections:
             bbox = det['bbox']
-            track_id = det['track_id']
+            track_id = det.get('track_id', '?')
+            person_id = det.get('person_id', 'Unknown')
             confidence = det['confidence']
-            age = det['age']
-            hits = det['hits']
-            color = det['color']
-            is_confirmed = det['is_confirmed']
+            status = det['status']
+            color = det.get('color', (0, 255, 0))
 
             x1, y1, x2, y2 = map(int, bbox)
 
-            # Цвет в зависимости от статуса
-            if not is_confirmed:
-                color = (0, 165, 255)  # Оранжевый для неподтвержденных
-            elif hits < 10:
-                color = (0, 255, 255)  # Желтый для новых
-            else:
-                color = color  # Уникальный цвет для стабильных
-
             # Прямоугольник
-            thickness = 3 if is_confirmed else 2
+            thickness = 3 if status == 'KNOWN' else 2
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
-            # Фон для текста
-            status = "✓" if is_confirmed else "?"
-            text = f"{status}{track_id}"
-            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            # ID и статус
+            if status == 'KNOWN':
+                text = f"ID: {person_id}"
+                subtext = f"Conf: {confidence:.1%}"
+            else:
+                text = f"NEW: {person_id}"
+                subtext = f"New person"
 
-            cv2.rectangle(frame, (x1, y1 - text_size[1] - 10),
+            # Фон для текста
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(frame, (x1, y1 - text_size[1] - 25),
                           (x1 + text_size[0], y1), color, -1)
 
-            # ID
-            cv2.putText(frame, text, (x1, y1 - 5),
+            # Основной текст
+            cv2.putText(frame, text, (x1, y1 - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            # Статистика
-            stats = f"{hits}h"
-            if confidence < 0.9:
-                stats += f" {confidence:.0%}"
+            # Дополнительный текст
+            cv2.putText(frame, subtext, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-            cv2.putText(frame, stats, (x1, y2 + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        # Статистика
+        active_known = len([d for d in detections if d['status'] == 'KNOWN'])
+        active_new = len([d for d in detections if d['status'] == 'NEW'])
 
-        # Общая статистика
-        stats_text = (f"Людей: {len(detections)} | "
-                      f"Треков: {len(self.tracks)} | "
-                      f"FPS: {np.mean(self.fps_history):.1f}" if self.fps_history else "0")
+        stats_text = (f"Людей: {len(detections)} "
+                      f"(Известных: {active_known}, Новых: {active_new})")
 
         cv2.putText(frame, stats_text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Информация о базе
+        db_info = f"В базе: {len(self.face_db.face_cache)} лиц"
+        cv2.putText(frame, db_info, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # Время
         time_text = datetime.now().strftime("%H:%M:%S")
         cv2.putText(frame, time_text, (frame.shape[1] - 120, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+    def _maintenance_thread(self):
+        """Поток обслуживания"""
+        print("🔧 Поток обслуживания запущен")
+
+        while self.running:
+            try:
+                # Каждые 5 минут сохраняем статистику
+                if int(time.time()) % 300 == 0:
+                    self._save_statistics()
+
+                # Каждые 30 минут очищаем старые данные
+                if int(time.time()) % 1800 == 0:
+                    self.face_db.cleanup_old_data(days_to_keep=7)
+
+                # Ежечасная статистика
+                if int(time.time()) % 3600 == 0:
+                    self._print_hourly_stats()
+
+                time.sleep(1)
+
+            except Exception as e:
+                print(f"⚠ Ошибка обслуживания: {e}")
+                time.sleep(5)
+
+    def _save_statistics(self):
+        """Сохранение статистики"""
+        try:
+            stats_file = "data/statistics.json"
+            stats = {
+                'timestamp': datetime.now().isoformat(),
+                'total_frames': self.stats['total_frames'],
+                'total_detections': self.stats['total_detections'],
+                'known_detections': self.stats.get('known_detections', 0),
+                'new_detections': self.stats.get('new_detections', 0),
+                'active_tracks': len(self.active_tracks),
+                'database_size': len(self.face_db.face_cache),
+                'uptime_hours': (time.time() - self.stats['start_time']) / 3600
+            }
+
+            os.makedirs(os.path.dirname(stats_file), exist_ok=True)
+            with open(stats_file, 'w') as f:
+                json.dump(stats, f, indent=2)
+
+            print(f"📊 Статистика сохранена: {stats_file}")
+
+        except Exception as e:
+            print(f"⚠ Ошибка сохранения статистики: {e}")
+
+    def _print_hourly_stats(self):
+        """Вывод ежечасной статистики"""
+        db_stats = self.face_db.get_statistics(period_hours=1)
+
+        print(f"\n{'=' * 50}")
+        print(f"📈 ЕЖЕЧАСНАЯ СТАТИСТИКА")
+        print(f"{'=' * 50}")
+        print(f"• Всего лиц в базе: {db_stats.get('total_people', 0)}")
+        print(f"• Уникальных за час: {db_stats.get('recent_people', 0)}")
+        print(f"• Детекций за час: {db_stats.get('recent_detections', 0)}")
+        print(f"• Активных треков: {len(self.active_tracks)}")
+        print(f"• Всего кадров: {self.stats['total_frames']}")
+        print(f"{'=' * 50}\n")
+
+    def _get_stats(self):
+        """Получение текущей статистики"""
+        return {
+            'total_frames': self.stats['total_frames'],
+            'total_detections': self.stats['total_detections'],
+            'active_tracks': len(self.active_tracks),
+            'database_size': len(self.face_db.face_cache),
+            'known_in_frame': len([d for d in self.active_tracks.values()]),
+            'uptime': (time.time() - self.stats['start_time']) / 3600
+        }
+
     def get_current_frame(self):
-        """Получить текущий обработанный кадр"""
+        """Получить текущий кадр"""
         if not self.processed_queue.empty():
             return self.processed_queue.get()
         return None
 
-    def get_statistics(self):
-        """Получить статистику"""
-        return {
-            'current_count': self.current_count,
-            'today_unique': len(self.today_unique),
-            'session_unique': len(self.session_unique),
-            'total_detections': self.total_detections,
-            'total_frames': self.total_frames,
-            'active_tracks': len(self.tracks),
-            'lost_tracks': len(self.lost_tracks),
-            'avg_fps': np.mean(self.fps_history) if self.fps_history else 0,
-            'appearance_db_size': len(self.appearance_db.embeddings)
-        }
-
     def get_detailed_statistics(self):
-        """Подробная статистика"""
-        tracks_info = []
-        for track_id, track in list(self.tracks.items())[:20]:
-            tracks_info.append({
-                'id': track_id,
-                'age': track.age,
-                'hits': track.hits,
-                'confirmed': track.is_confirmed,
-                'invisible': track.consecutive_invisible,
-                'reliable': track.is_reliable()
-            })
+        """Получить детальную статистику"""
+        db_stats = self.face_db.get_statistics(period_hours=24)
 
         return {
-            'summary': self.get_statistics(),
-            'tracks': tracks_info,
+            'system': self._get_stats(),
+            'database': db_stats,
+            'active_sessions': len(self.sessions),
             'timestamp': datetime.now().isoformat()
         }
 
+    def get_person_info(self, person_id):
+        """Получить информацию о человеке"""
+        return self.face_db.get_person_history(person_id)
+
+    def register_person(self, name, embedding=None, images=None):
+        """Регистрация нового человека"""
+        if embedding is None and images:
+            # Создаем эмбеддинг из изображений
+            embeddings = []
+            for img in images[:3]:  # Используем до 3 изображений
+                emb = self.reid_model.extract_embedding(img)
+                if emb is not None:
+                    embeddings.append(emb)
+
+            if embeddings:
+                embedding = np.mean(embeddings, axis=0)
+
+        if embedding is not None:
+            face_id, person_id = self.face_db.add_face(
+                embedding=embedding,
+                name=name,
+                confidence=0.9
+            )
+
+            return {
+                'success': face_id is not None,
+                'face_id': face_id,
+                'person_id': person_id,
+                'message': f'Person {name} registered successfully'
+            }
+
+        return {
+            'success': False,
+            'message': 'Failed to extract embedding'
+        }
+
     def stop(self):
-        """Остановка"""
-        print("🛑 Остановка видео процессора...")
+        """Остановка системы"""
+        print("🛑 Остановка системы...")
 
         self.running = False
-        self.stop_event.set()
 
-        # Сохраняем данные
-        self._save_persistent_data()
+        # Завершаем все активные сессии
+        for face_id, session_id in list(self.sessions.items()):
+            self.face_db.end_session(session_id)
 
-        # Освобождаем ресурсы
+        # Сохраняем статистику
+        self._save_statistics()
+
+        # Закрываем базу данных
+        self.face_db.close()
+
+        # Освобождаем ресурсы камеры
         if self.cap:
             self.cap.release()
 
-        # Очищаем очереди
-        while not self.frame_queue.empty():
-            self.frame_queue.get()
-        while not self.processed_queue.empty():
-            self.processed_queue.get()
-
-        print("✅ Видео процессор остановлен")
+        print("✅ Система остановлена")
