@@ -9,6 +9,9 @@ class Settings:
     RTSP_URL = os.getenv("RTSP_URL", "rtsp://admin:admin@10.0.0.242:554/live/main")
     CAMERA_ID = "trassir_tr-d1415_1"
 
+    # Путь к базе данных
+    DB_PATH = "data/face_database.db"
+
     # Настройки обработки
     FRAME_WIDTH = 1280
     FRAME_HEIGHT = 720
@@ -19,15 +22,24 @@ class Settings:
     YOLO_MODEL_PATH = os.path.join(os.path.dirname(__file__), "../../models/yolo/yolov8n.pt")
     FACENET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "../../models/facenet/facenet.pb")
 
-    # Пороги - ИСПРАВЛЕНО ИМЯ ПЕРЕМЕННОЙ
-    CONFIDENCE_THRESHOLD = 0.5  # было CONFENCE_THRESHOLD
-    FACE_MATCH_THRESHOLD = 0.6
+    # Директории для данных
+    DATA_DIR = "data"
+    EXPORTS_DIR = "data/exports"
+    STATISTICS_DIR = "data/statistics"
+
+    # Пороги
+    CONFIDENCE_THRESHOLD = 0.6  # Порог детекции YOLO
+    FACE_MATCH_THRESHOLD = 0.75  # Порог для распознавания лиц (увеличено!)
     TRACKING_MAX_AGE = 30
 
     # Веб-сервер
     WEB_HOST = "0.0.0.0"
     WEB_PORT = 8000
     API_PORT = 8080
+
+    # Настройки дедупликации
+    DEDUPLICATION_THRESHOLD = 0.85  # Порог для дедупликации
+    MIN_FACE_QUALITY = 0.4  # Минимальное качество лица для обработки
 
 
 settings = Settings()
